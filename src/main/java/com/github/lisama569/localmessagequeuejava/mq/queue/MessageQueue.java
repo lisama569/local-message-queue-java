@@ -33,6 +33,21 @@ public interface MessageQueue {
     long backlog(TopicPartition tp);
 
     /**
+     * 当前尚未被确认而占用容量的消息条数。
+     */
+    long unacked(TopicPartition tp);
+
+    /**
+     * 消息被确认后释放其占用的容量。
+     */
+    void releaseOne(TopicPartition tp);
+
+    /**
+     * 消费组启动/接管时，按已确认位点与物理存活区间重建未确认计数。
+     */
+    void reconcileUnacked(TopicPartition tp, long committedOffset);
+
+    /**
      * 分区容量上限。
      */
     long capacity(TopicPartition tp);

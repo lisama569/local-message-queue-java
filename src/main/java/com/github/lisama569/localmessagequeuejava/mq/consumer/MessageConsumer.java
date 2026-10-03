@@ -82,10 +82,12 @@ public class MessageConsumer implements AutoCloseable {
                     InFlight recovered = new InFlight(h.offset(), h.messageId(), h.attempts() + 1,
                             Stage.RETRY_WAIT, System.currentTimeMillis() + backoffMs(h.attempts() + 1),
                             "进程中断恢复，按可重试失败重新调度");
-                    states.put(tp, new PartitionState(st.committedOffset(), recovered));
+                    states.put(tp, new PartitionState(st.committedOffset(), recovered, st.paused()));
                     log.info("[恢复] group={} partition={} offset={} messageId={} 判定=IN_FLIGHT中断→退避重试 attempts={}",
                             group, tp.key(), h.offset(), h.messageId(), recovered.attempts());
                 }
+                // 接管分区时按已确认位点重建未确认计数，使容量水位与消费进度一致
+                queue.reconcileUnacked(tp, states.get(tp).committedOffset());
             }
             persist();
         }
@@ -120,6 +122,10 @@ public class MessageConsumer implements AutoCloseable {
         synchronized (stateLock) {
             PartitionState st = states.get(tp);
             if (st == null) {
+                return;
+            }
+            // 暂停闸门：不拉取新消息，也不重投退避到期消息；队头状态与顺序原样保留
+            if (st.paused()) {
                 return;
             }
             if (!st.hasHead()) {
@@ -173,10 +179,13 @@ public class MessageConsumer implements AutoCloseable {
         Message msg = queue.fetch(tp, head.offset());
         if (msg == null) {
             // 日志被裁剪等异常情况：跳过该位点，避免卡死
+            boolean paused;
             synchronized (stateLock) {
-                states.put(tp, new PartitionState(head.offset() + 1, null));
+                PartitionState st = states.get(tp);
+                paused = st.paused();
+                states.put(tp, new PartitionState(head.offset() + 1, null, paused));
                 persist();
-                releaseCapacity(tp);
+                afterCommit(tp, head.offset() + 1);
             }
             log.warn("[跳过] group={} partition={} offset={} messageId={} 判定=位点无数据直接确认",
                     group, tp.key(), head.offset(), head.messageId());
@@ -184,10 +193,13 @@ public class MessageConsumer implements AutoCloseable {
         }
         // 重复投递去重：已确认过的消息不再触发副作用
         if (processedIdStore.contains(msg.id())) {
+            boolean paused;
             synchronized (stateLock) {
-                states.put(tp, new PartitionState(head.offset() + 1, null));
+                PartitionState st = states.get(tp);
+                paused = st.paused();
+                states.put(tp, new PartitionState(head.offset() + 1, null, paused));
                 persist();
-                releaseCapacity(tp);
+                afterCommit(tp, head.offset() + 1);
             }
             log.info("[去重] group={} partition={} offset={} messageId={} 判定=已确认过，跳过副作用直接确认",
                     group, tp.key(), head.offset(), msg.id());
@@ -195,11 +207,14 @@ public class MessageConsumer implements AutoCloseable {
         }
         try {
             invokeWithTimeout(msg);
+            boolean paused;
             synchronized (stateLock) {
+                PartitionState st = states.get(tp);
+                paused = st.paused();
                 processedIdStore.add(msg.id());
-                states.put(tp, new PartitionState(head.offset() + 1, null));
+                states.put(tp, new PartitionState(head.offset() + 1, null, paused));
                 persist();
-                releaseCapacity(tp);
+                afterCommit(tp, head.offset() + 1);
             }
             log.info("[确认] group={} partition={} offset={} messageId={} 判定=处理成功",
                     group, tp.key(), head.offset(), msg.id());
@@ -242,20 +257,23 @@ public class MessageConsumer implements AutoCloseable {
             PartitionState st = states.get(tp);
             if (t instanceof NonRetryableException) {
                 deadLetter(tp, msg, attempts, FailureType.NON_RETRYABLE, error);
-                states.put(tp, new PartitionState(head.offset() + 1, null));
-                releaseCapacity(tp);
+                states.put(tp, new PartitionState(head.offset() + 1, null, st.paused()));
+                persist();
+                afterCommit(tp, head.offset() + 1);
                 log.info("[死信] group={} partition={} offset={} messageId={} 判定=不可重试失败 原因={}",
                         group, tp.key(), head.offset(), msg.id(), error);
             } else if (attempts >= options.getMaxAttempts()) {
                 deadLetter(tp, msg, attempts, FailureType.RETRY_EXHAUSTED, error);
-                states.put(tp, new PartitionState(head.offset() + 1, null));
-                releaseCapacity(tp);
+                states.put(tp, new PartitionState(head.offset() + 1, null, st.paused()));
+                persist();
+                afterCommit(tp, head.offset() + 1);
                 log.info("[死信] group={} partition={} offset={} messageId={} 判定=重试耗尽 attempts={} 原因={}",
                         group, tp.key(), head.offset(), msg.id(), attempts, error);
             } else {
                 long retryAt = System.currentTimeMillis() + backoffMs(attempts);
                 states.put(tp, new PartitionState(st.committedOffset(),
-                        new InFlight(head.offset(), msg.id(), attempts, Stage.RETRY_WAIT, retryAt, error)));
+                        new InFlight(head.offset(), msg.id(), attempts, Stage.RETRY_WAIT, retryAt, error),
+                        st.paused()));
                 log.info("[退避] group={} partition={} offset={} messageId={} 判定=可重试失败 attempts={} 原因={}",
                         group, tp.key(), head.offset(), msg.id(), attempts, error);
             }
@@ -279,16 +297,75 @@ public class MessageConsumer implements AutoCloseable {
     }
 
     /**
-     * 确认后物理裁剪已提交日志以释放分区容量（可选，单消费者组场景）。
+     * 一条消息被确认（成功/去重/死信）后的容量处理：
+     * 立即释放 1 个未确认占额；开启裁剪时再物理丢弃已提交历史日志。
+     * 必须在持有 stateLock 时调用。
      */
-    private void releaseCapacity(TopicPartition tp) {
-        if (!options.isTruncateCommittedLog()) {
-            return;
+    private void afterCommit(TopicPartition tp, long committedOffset) {
+        queue.releaseOne(tp);
+        if (options.isTruncateCommittedLog()) {
+            queue.truncateBefore(tp, committedOffset);
         }
-        PartitionState st = states.get(tp);
-        if (st != null) {
-            queue.truncateBefore(tp, st.committedOffset());
+    }
+
+    /**
+     * 暂停某分区投递：不影响在途处理，但不再拉取新消息/重投退避消息；
+     * 未确认状态与分区内顺序原样保留。重复调用幂等。
+     */
+    public boolean pause(TopicPartition tp) {
+        synchronized (stateLock) {
+            PartitionState st = states.get(tp);
+            if (st == null) {
+                throw new IllegalArgumentException("订阅中不存在该分区: group=" + group + " " + tp.key());
+            }
+            if (st.paused()) {
+                log.info("[暂停] group={} partition={} 判定=已处于暂停态，重复调用保持不变",
+                        group, tp.key());
+                return false;
+            }
+            states.put(tp, st.withPaused(true));
+            persist();
+            log.info("[暂停] group={} partition={} committed={} head={} 判定=停止投递，未确认状态保留",
+                    group, tp.key(), st.committedOffset(),
+                    st.hasHead() ? st.head().offset() + "/" + st.head().messageId() : "无");
+            return true;
         }
+    }
+
+    /**
+     * 恢复某分区投递：从暂停前保留的位点/队头继续，不跳过任何消息。重复调用幂等。
+     */
+    public boolean resume(TopicPartition tp) {
+        synchronized (stateLock) {
+            PartitionState st = states.get(tp);
+            if (st == null) {
+                throw new IllegalArgumentException("订阅中不存在该分区: group=" + group + " " + tp.key());
+            }
+            if (!st.paused()) {
+                log.info("[恢复投递] group={} partition={} 判定=本就处于投递态，重复调用保持不变",
+                        group, tp.key());
+                return false;
+            }
+            states.put(tp, st.withPaused(false));
+            persist();
+            log.info("[恢复投递] group={} partition={} committed={} head={} 判定=从原位点继续投递",
+                    group, tp.key(), st.committedOffset(),
+                    st.hasHead() ? st.head().offset() + "/" + st.head().messageId() : "无");
+            return true;
+        }
+    }
+
+    /** 当前处于暂停态的分区（测试与运维查询）。 */
+    public Set<TopicPartition> pausedPartitions() {
+        synchronized (stateLock) {
+            return states.entrySet().stream().filter(e -> e.getValue().paused())
+                    .map(Map.Entry::getKey).collect(java.util.stream.Collectors.toSet());
+        }
+    }
+
+    /** 订阅的分区集合。 */
+    public Set<TopicPartition> subscriptions() {
+        return Set.copyOf(subscriptions);
     }
 
     /**

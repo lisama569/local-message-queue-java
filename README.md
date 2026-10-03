@@ -6,8 +6,11 @@
 ## 能力总览
 
 - 主题 / 分区 / 消费者组语义：同一分区内按位点严格有序处理，不同分区由独立 worker 并发推进
+- **订阅者不停机热替换**：同一消费组可在运行中换成新处理逻辑（灰度升级 / 回滚），新老订阅者不同时处理同一分区
+- **按分区暂停 / 恢复投递**：只停指定分区，未确认状态与顺序保留，恢复后从原位点继续（可反复调用）
 - 失败分类、指数退避重试与死信（DLQ），三类失败结果可区分
-- 重启恢复：位点、未确认队头、已确认去重集合、死信全部持久化，进程中断后状态一致
+- 重启恢复：位点、未确认队头、已确认去重集合、暂停标记、死信全部持久化，进程中断后状态一致
+- **积压与容量水位**：容量按“尚未确认的消息”实时计量，确认即释放；可按分区查询积压 / 容量 / 剩余
 - 积压控制与优雅关停：容量边界与关停拒绝原因明确可区分
 - 死信重放：保留原始载荷重新投递，且不绕过重复消费约束
 
@@ -29,12 +32,28 @@ curl -X POST localhost:8080/api/mq/send -H 'Content-Type: application/json' \
   -d '{"topic":"orders","partition":0,"messageId":"m1","payload":"hello"}'
 # 查询消费组确认位点
 curl 'localhost:8080/api/mq/offsets?group=g1'
+# 查询所有分区的积压/容量水位（backlog=未确认条数，remaining=离上限还可接收多少）
+curl 'localhost:8080/api/mq/watermarks'
+# 暂停 / 恢复某消费组在指定分区上的投递（changed 表示状态是否发生变化，重复调用为 false）
+curl -X POST 'localhost:8080/api/mq/pause?group=g1&topic=orders&partition=0'
+curl -X POST 'localhost:8080/api/mq/resume?group=g1&topic=orders&partition=0'
 # 查询 / 重放死信
 curl 'localhost:8080/api/mq/dead-letters?group=g1'
 curl -X POST 'localhost:8080/api/mq/dead-letters/replay?group=g1&messageId=m1'
 ```
 
-编程式使用见 `MqService` 与测试用例（`src/test/java/.../mq/`）。
+编程式使用见 `MqService` 与测试用例（`src/test/java/.../mq/`）：
+
+```java
+// 运行中把 g1 的处理逻辑换成 newHandler（灰度升级；出问题可再换回去回滚）
+service.replaceConsumer("g1", newHandler, ConsumerOptions.defaults(), null); // null=沿用原订阅分区
+// 只暂停 / 恢复某个分区
+service.pause("g1", new TopicPartition("orders", 0));
+service.resume("g1", new TopicPartition("orders", 0));
+// 查询单分区 / 全部分区水位
+PartitionWatermark wm = service.watermark(new TopicPartition("orders", 0)); // backlog/capacity/remaining
+Map<TopicPartition, PartitionWatermark> all = service.watermarks();
+```
 
 ## 交付语义
 
@@ -46,6 +65,44 @@ curl -X POST 'localhost:8080/api/mq/dead-letters/replay?group=g1&messageId=m1'
 - **跨分区并发**：每个分区独立的单线程 worker，互不阻塞。
 - **业务幂等边界**：若处理器在“副作用已发生但确认未落盘”的窗口内被kill，
   框架无法感知该副作用——业务副作用应与消息 id 幂等绑定（框架去重键即消息 id）。
+
+## 订阅者热替换（灰度升级 / 回滚）
+
+`MqService.replaceConsumer(group, handler, options, partitions)` 在**不停服务、不丢订阅**的前提下
+替换同一消费组的处理逻辑（`partitions` 传 `null` 表示沿用旧订阅的分区集合）。
+
+切换严格按“**先完全停止旧订阅者，再启动新订阅者**”的顺序进行：
+
+1. 旧订阅者停止拉取新任务，协调线程退出；
+2. 等待旧订阅者的在途处理完成并落盘（宽限期 = `max(5s, processingTimeout + 2s)`），超时则中断在途处理；
+3. 新订阅者复用同一组的 `state.json` / `processed.log` / `dlq.log` 启动，按已确认位点接管各分区。
+
+**切换窗口内的保证：**
+
+- 同一分区在任一时刻只属于一个订阅者，**不可能出现新老订阅者同时处理同一分区**；
+- **未确认消息不丢**：切换时仍未确认的队头（含被中断的在途处理）按中断恢复规则落盘为退避重投，
+  由新订阅者从该未确认位置继续；
+- **已确认消息不重**：已确认位点之前的消息不再投递；即使消息被新逻辑再次见到，
+  `processed.log` 去重集合也保证不产生第二次副作用；
+- 分区内顺序与退避/死信计数在切换前后连续。
+
+注意：在途处理被超时中断属于“副作用未知”窗口，业务副作用仍须与消息 id 幂等绑定（见业务幂等边界）。
+同一 group 直接再次调用 `registerConsumer` 会抛 `IllegalStateException`，以防误用造成两个订阅者并存；
+热替换必须走 `replaceConsumer`。
+
+## 按分区暂停 / 恢复投递
+
+`MqService.pause(group, tp)` / `resume(group, tp)`（HTTP：`POST /api/mq/pause|resume`）
+只作用于指定消费组的指定分区：
+
+- **暂停期间**：不再拉取新消息，退避到期的消息也不会重投；
+  但暂停瞬间**已经在途**的处理允许跑完（其确认/死信正常落盘）。
+- **状态保留**：已确认位点、未确认队头（含退避状态与尝试次数）、分区内顺序全部原样保留，
+  暂停期间新发送的消息可入队占容量但不会被投递。
+- **恢复后**：从暂停前的位点/队头继续，**不跳过任何消息**，顺序不变；
+  其他分区全程不受影响、照常并发推进。
+- **可反复调用**：重复暂停 / 重复恢复是幂等的（返回 `changed=false`），不会出现暂停失效或恢复后跳消息。
+- 暂停标记持久化在 `state.json` 中，**进程重启后仍保持暂停**，需显式 `resume` 才恢复投递。
 
 ## 重试与死信规则
 
@@ -68,18 +125,26 @@ curl -X POST 'localhost:8080/api/mq/dead-letters/replay?group=g1&messageId=m1'
   ```
   <dataDir>/topics/<topic>-<partition>/data.log   # 消息日志（追加写 + fsync）
   <dataDir>/topics/<topic>-<partition>/base       # 裁剪后的起始位点
-  <dataDir>/groups/<group>/state.json             # 确认位点 + 未确认队头（原子写）
+  <dataDir>/groups/<group>/state.json             # 确认位点 + 未确认队头 + 暂停标记（原子写）
   <dataDir>/groups/<group>/processed.log          # 已确认消息 id 集合
   <dataDir>/groups/<group>/dlq.log                # 死信记录
   ```
 
-## 积压控制与优雅关停
+## 积压、容量水位与优雅关停
 
-- 每分区容量上限（`perPartitionCapacity`）：达到上限时 `send` 抛出
-  `MessageRejectedException(QUEUE_FULL)`；关停期间抛出 `MessageRejectedException(SHUTTING_DOWN)`，
-  两种拒绝原因明确可区分。
-- 容量按物理保留日志计算；消费者开启 `truncateCommittedLog(true)` 后，
-  每次确认会物理裁剪已提交日志以释放容量（位点单调不复用，仅适用于单消费者组场景）。
+- 每分区容量上限（`perPartitionCapacity`）以**尚未被确认的消息条数**计量：
+  每发送一条占 1 个名额，消息一旦被确认（处理成功 / 去重跳过 / 进入死信）其名额**立即释放**，
+  随后即可接收新消息——**不依赖**日志裁剪，不会出现“积压已清空却仍一直拒收”。
+- 水位查询（`MqService.watermark(tp)` / `watermarks()`，HTTP：`GET /api/mq/watermarks`）按分区返回：
+  - `backlog`：当前未确认、仍占用容量的消息条数；
+  - `capacity`：该分区容量上限；
+  - `remaining = capacity - backlog`：离上限还能接收多少（用于判断该扩容还是消费卡住）。
+- 消费组启动 / 热替换接管分区时，按“末端位点 − max(已确认位点, 物理起始位点)”重建未确认计数，
+  重启后水位仍准确；无消费者时未确认计数保守地等于物理存活日志条数（不会超发容量）。
+- 达到上限时 `send` 抛出 `MessageRejectedException(QUEUE_FULL)`；
+  关停期间抛出 `MessageRejectedException(SHUTTING_DOWN)`，两种拒绝原因明确可区分（分类与旧版本一致）。
+- 容量口径与消费者组一一对应，沿用“单消费者组消费一个分区”的既有兼容范围；
+  `truncateCommittedLog(true)` 仍可选开启，用于物理裁剪已确认历史日志、控制磁盘占用（位点单调不复用）。
 - 优雅关停（`MqService.close()`）：先拒收新消息，再停止拉取新任务，
   等待在途处理完成（宽限期 = `max(5s, processingTimeout + 2s)`），超时强制中断；
   所有已开始处理的确认/重试/死信状态均已落盘，下次启动可恢复。
@@ -92,6 +157,21 @@ curl -X POST 'localhost:8080/api/mq/dead-letters/replay?group=g1&messageId=m1'
 | `DuplicateDeliveryTest` | 同一消息 id 重复投递，副作用恰好一次 |
 | `RestartRecoveryTest` | 处理超时分类为可重试；重启后未确认消息不丢失、已确认不重复 |
 | `DeadLetterReplayTest` | 三类失败可区分；死信保留载荷与原因；重放受去重约束 |
-| `CapacityBoundaryTest` | `QUEUE_FULL` / `SHUTTING_DOWN` 拒绝可区分；裁剪释放容量 |
+| `CapacityBoundaryTest` | `QUEUE_FULL` / `SHUTTING_DOWN` 拒绝可区分；裁剪释放容量（旧口径回归） |
+| `HotSwapConsumerTest` | 热替换不重不漏、从首个未确认位置继续；切换窗口无双跑；重复注册被拒 |
+| `PauseResumeTest` | 暂停期间停投但在途可完成、恢复后按序不跳消息；分区隔离；反复暂停/恢复稳定 |
+| `PauseRestartTest` | 暂停标记落盘，重启后仍暂停，恢复后从未确认位置继续 |
+| `BacklogWatermarkTest` | 确认即释放容量（不依赖裁剪）、积压清空立即复用、按分区水位、拒绝原因不回归 |
 
-测试日志均打印分区、位点、消息标识与判定依据（`[投递]/[确认]/[退避]/[死信]/[去重]/[恢复]/[断言]`）。
+测试日志均打印分区、位点、消息标识与判定依据
+（`[投递]/[确认]/[退避]/[死信]/[去重]/[恢复]/[暂停]/[恢复投递]/[热替换]/[容量]/[断言]`）。
+
+## 兼容范围
+
+- 新能力均为**增量扩展**，未改变既有发送 / 订阅 / 重试 / 死信 / 关停语义与异常分类。
+- 旧的 `state.json`（无 `paused` 字段）可被新版本直接读取，缺省按“未暂停”处理。
+- 容量计量从“物理日志条数”改为“未确认条数”：在单消费者组场景下两者结论一致，
+  且确认后无需裁剪即可复用容量；`queue.backlog()`（`GET /api/mq/backlog`）仍返回物理保留日志条数，
+  面向运维的真实未确认积压请使用 `watermark`（`GET /api/mq/watermarks`）。
+- 订阅者热替换与暂停/恢复均按“消费组 × 分区”生效，假设一个分区同一时间只被一个组的一个订阅者接管
+  （与现有单活订阅模型一致）。
