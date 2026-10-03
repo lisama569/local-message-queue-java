@@ -5,6 +5,7 @@ import com.github.lisama569.localmessagequeuejava.mq.consumer.MessageConsumer;
 import com.github.lisama569.localmessagequeuejava.mq.handler.MessageHandler;
 import com.github.lisama569.localmessagequeuejava.mq.model.DeadLetterRecord;
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
+import com.github.lisama569.localmessagequeuejava.mq.model.PartitionWatermark;
 import com.github.lisama569.localmessagequeuejava.mq.model.ReplayOutcome;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
 import com.github.lisama569.localmessagequeuejava.mq.queue.LocalMessageQueue;
@@ -53,12 +54,64 @@ public class MqService implements AutoCloseable {
 
     public MessageConsumer registerConsumer(String group, MessageHandler handler, ConsumerOptions options,
                                             List<TopicPartition> partitions) {
-        GroupStores stores = storesOf(group);
-        MessageConsumer consumer = new MessageConsumer(group, queue, handler, stores.stateStore(),
-                stores.processedIdStore(), stores.deadLetterStore(), options);
+        GroupStores shared = storesOf(group);
+        MessageConsumer existing = consumers.get(group);
+        if (existing != null && existing.isRunning()) {
+            throw new IllegalStateException("消费组已存在运行中的订阅者，热替换请使用 replaceConsumer: group=" + group);
+        }
+        MessageConsumer consumer = new MessageConsumer(group, queue, handler, shared.stateStore(),
+                shared.processedIdStore(), shared.deadLetterStore(), options);
         consumer.subscribe(partitions);
         consumer.start();
         consumers.put(group, consumer);
+        return consumer;
+    }
+
+    /**
+     * 订阅者不停机热替换（灰度升级/回滚）：
+     * <ol>
+     *   <li>优雅关停旧订阅者：停止拉取新任务，等待在途处理完成并落盘，保证切换窗口内
+     *       新老订阅者不会同时处理同一分区；</li>
+     *   <li>用新处理器启动新订阅者，从共享的已确认位点/未确认队头/暂停标志继续，
+     *       已确认消息命中去重不再产生副作用，未确认消息不丢失。</li>
+     * </ol>
+     */
+    public MessageConsumer replaceConsumer(String group, MessageHandler newHandler, ConsumerOptions options,
+                                           List<TopicPartition> partitions) {
+        MessageConsumer old = consumers.remove(group);
+        if (old != null) {
+            old.close();
+        }
+        return registerConsumer(group, newHandler, options, partitions);
+    }
+
+    /** 按分区暂停某消费组的投递（幂等）。 */
+    public void pause(String group, TopicPartition tp) {
+        requireConsumer(group).pause(tp);
+    }
+
+    /** 按分区恢复某消费组的投递（幂等），从暂停位置继续。 */
+    public void resume(String group, TopicPartition tp) {
+        requireConsumer(group).resume(tp);
+    }
+
+    public boolean isPaused(String group, TopicPartition tp) {
+        MessageConsumer consumer = consumers.get(group);
+        return consumer != null && consumer.isPaused(tp);
+    }
+
+    /**
+     * 按分区查询积压与容量水位：未确认条数、已确认位点、距容量上限剩余条数、暂停状态。
+     */
+    public PartitionWatermark watermark(String group, TopicPartition tp) {
+        return queue.watermark(tp, isPaused(group, tp));
+    }
+
+    private MessageConsumer requireConsumer(String group) {
+        MessageConsumer consumer = consumers.get(group);
+        if (consumer == null || !consumer.isRunning()) {
+            throw new IllegalStateException("消费组不存在运行中的订阅者: group=" + group);
+        }
         return consumer;
     }
 

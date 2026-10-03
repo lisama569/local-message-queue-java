@@ -2,6 +2,7 @@ package com.github.lisama569.localmessagequeuejava.mq.queue;
 
 import com.github.lisama569.localmessagequeuejava.mq.exception.MessageRejectedException;
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
+import com.github.lisama569.localmessagequeuejava.mq.model.PartitionWatermark;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
 
 import java.util.Collection;
@@ -28,7 +29,8 @@ public interface MessageQueue {
     long nextOffset(TopicPartition tp);
 
     /**
-     * 当前积压条数（物理日志条数）。
+     * 当前积压条数：尚未被确认的消息数 = nextOffset - 已确认位点水位。
+     * 消息一旦确认，占用的容量立即释放。
      */
     long backlog(TopicPartition tp);
 
@@ -36,6 +38,18 @@ public interface MessageQueue {
      * 分区容量上限。
      */
     long capacity(TopicPartition tp);
+
+    /**
+     * 分区积压/容量水位（含已确认位点、剩余可接收条数）。
+     *
+     * @param paused 调用方（消费组视角）的暂停状态，仅用于展示
+     */
+    PartitionWatermark watermark(TopicPartition tp, boolean paused);
+
+    /**
+     * 推进已确认位点水位（该位点之前的消息均已确认），单调递增，确认后立即释放容量。
+     */
+    void markCommitted(TopicPartition tp, long committedOffset);
 
     Collection<TopicPartition> partitions();
 

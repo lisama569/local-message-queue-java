@@ -2,6 +2,7 @@ package com.github.lisama569.localmessagequeuejava.mq.queue;
 
 import com.github.lisama569.localmessagequeuejava.mq.exception.MessageRejectedException;
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
+import com.github.lisama569.localmessagequeuejava.mq.model.PartitionWatermark;
 import com.github.lisama569.localmessagequeuejava.mq.model.RejectReason;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
 import com.github.lisama569.localmessagequeuejava.mq.store.FileMessageLogStore;
@@ -39,9 +40,9 @@ public class LocalMessageQueue implements MessageQueue {
             throw new MessageRejectedException(RejectReason.SHUTTING_DOWN,
                     "队列正在关停，拒绝接收新消息: " + tp.key() + " id=" + messageId);
         }
-        if (logStore.size(tp) >= perPartitionCapacity) {
+        if (backlog(tp) >= perPartitionCapacity) {
             throw new MessageRejectedException(RejectReason.QUEUE_FULL,
-                    "分区积压达到容量上限 " + perPartitionCapacity + ": " + tp.key() + " id=" + messageId);
+                    "分区未确认积压达到容量上限 " + perPartitionCapacity + ": " + tp.key() + " id=" + messageId);
         }
         long offset = logStore.append(tp, messageId, payload);
         knownPartitions.add(tp);
@@ -65,12 +66,28 @@ public class LocalMessageQueue implements MessageQueue {
 
     @Override
     public long backlog(TopicPartition tp) {
-        return logStore.size(tp);
+        return Math.max(0, logStore.nextOffset(tp) - logStore.loadCommittedOffset(tp));
     }
 
     @Override
     public long capacity(TopicPartition tp) {
         return perPartitionCapacity;
+    }
+
+    @Override
+    public PartitionWatermark watermark(TopicPartition tp, boolean paused) {
+        long base = logStore.baseOffset(tp);
+        long next = logStore.nextOffset(tp);
+        long committed = logStore.loadCommittedOffset(tp);
+        long unacked = Math.max(0, next - committed);
+        long remaining = Math.max(0, perPartitionCapacity - unacked);
+        return new PartitionWatermark(tp.topic(), tp.partition(), base, next, committed,
+                unacked, perPartitionCapacity, remaining, paused);
+    }
+
+    @Override
+    public void markCommitted(TopicPartition tp, long committedOffset) {
+        logStore.saveCommittedOffset(tp, committedOffset);
     }
 
     @Override

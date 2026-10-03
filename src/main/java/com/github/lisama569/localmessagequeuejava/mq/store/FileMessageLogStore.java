@@ -21,6 +21,7 @@ public class FileMessageLogStore implements MessageLogStore {
 
     private final Path rootDir;
     private final Map<TopicPartition, PartitionLog> logs = new ConcurrentHashMap<>();
+    private final Map<TopicPartition, Long> committedOffsets = new ConcurrentHashMap<>();
 
     public FileMessageLogStore(Path rootDir) {
         this.rootDir = rootDir;
@@ -165,5 +166,51 @@ public class FileMessageLogStore implements MessageLogStore {
             throw new UncheckedIOException("裁剪日志落盘失败: " + tp, e);
         }
         logs.put(tp, new PartitionLog(newBase, kept.size()));
+        long finalBase = newBase;
+        committedOffsets.compute(tp, (k, v) -> v == null ? finalBase : Math.max(v, finalBase));
+    }
+
+    @Override
+    public long loadCommittedOffset(TopicPartition tp) {
+        Long cached = committedOffsets.get(tp);
+        if (cached != null) {
+            return cached;
+        }
+        long base = state(tp).baseOffset();
+        Path committedFile = partitionDir(tp).resolve("committed");
+        long value = base;
+        if (Files.exists(committedFile)) {
+            try {
+                value = Long.parseLong(Files.readString(committedFile, StandardCharsets.UTF_8).trim());
+            } catch (IOException e) {
+                throw new UncheckedIOException("读取已确认位点水位失败: " + tp, e);
+            }
+        }
+        value = Math.max(value, base);
+        committedOffsets.putIfAbsent(tp, value);
+        return value;
+    }
+
+    @Override
+    public synchronized void saveCommittedOffset(TopicPartition tp, long committedOffset) {
+        long current = loadCommittedOffset(tp);
+        if (committedOffset <= current) {
+            return;
+        }
+        Path dir = partitionDir(tp);
+        Path committedFile = dir.resolve("committed");
+        Path tmp = dir.resolve("committed.tmp");
+        try {
+            Files.createDirectories(dir);
+            Files.writeString(tmp, Long.toString(committedOffset), StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
+                ch.force(true);
+            }
+            Files.move(tmp, committedFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            throw new UncheckedIOException("持久化已确认位点水位失败: " + tp, e);
+        }
+        committedOffsets.put(tp, committedOffset);
     }
 }

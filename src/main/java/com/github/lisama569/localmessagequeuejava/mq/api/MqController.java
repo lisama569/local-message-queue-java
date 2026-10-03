@@ -3,6 +3,7 @@ package com.github.lisama569.localmessagequeuejava.mq.api;
 import com.github.lisama569.localmessagequeuejava.mq.MqService;
 import com.github.lisama569.localmessagequeuejava.mq.model.DeadLetterRecord;
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
+import com.github.lisama569.localmessagequeuejava.mq.model.PartitionWatermark;
 import com.github.lisama569.localmessagequeuejava.mq.model.ReplayOutcome;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -50,10 +51,32 @@ public class MqController {
                 .collect(Collectors.toMap(e -> e.getKey().key(), Map.Entry::getValue));
     }
 
+    /**
+     * 按分区查询积压与容量水位（未确认条数、已确认位点、剩余容量、暂停状态）。
+     */
     @GetMapping("/backlog")
-    public Map<String, Long> backlog(@RequestParam String topic, @RequestParam int partitions) {
+    public Map<String, PartitionWatermark> backlog(@RequestParam String group, @RequestParam String topic,
+                                                   @RequestParam int partitions) {
         return java.util.stream.IntStream.range(0, partitions).boxed()
                 .collect(Collectors.toMap(p -> topic + "#" + p,
-                        p -> mqService.queue().backlog(new TopicPartition(topic, p))));
+                        p -> mqService.watermark(group, new TopicPartition(topic, p))));
+    }
+
+    /** 暂停某消费组在指定分区上的投递（幂等）。 */
+    @PostMapping("/pause")
+    public Map<String, Object> pause(@RequestParam String group, @RequestParam String topic,
+                                     @RequestParam int partition) {
+        TopicPartition tp = new TopicPartition(topic, partition);
+        mqService.pause(group, tp);
+        return Map.of("group", group, "partition", tp.key(), "paused", true);
+    }
+
+    /** 恢复某消费组在指定分区上的投递（幂等）。 */
+    @PostMapping("/resume")
+    public Map<String, Object> resume(@RequestParam String group, @RequestParam String topic,
+                                      @RequestParam int partition) {
+        TopicPartition tp = new TopicPartition(topic, partition);
+        mqService.resume(group, tp);
+        return Map.of("group", group, "partition", tp.key(), "paused", false);
     }
 }

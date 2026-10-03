@@ -40,6 +40,16 @@ public interface MessageLogStore {
     void truncateBefore(TopicPartition tp, long truncateBefore);
 
     /**
+     * 读取已确认位点水位（该位点之前的消息均已确认）；无记录时返回分区起始位点。
+     */
+    long loadCommittedOffset(TopicPartition tp);
+
+    /**
+     * 持久化已确认位点水位，位点单调推进（传入更小的值时保留较大值）。
+     */
+    void saveCommittedOffset(TopicPartition tp, long committedOffset);
+
+    /**
      * 一条日志原始记录。
      */
     record LogEntry(long offset, String messageId, String payload, long createdAtMs) {
