@@ -28,9 +28,14 @@ public interface MessageQueue {
     long nextOffset(TopicPartition tp);
 
     /**
-     * 当前积压条数（物理日志条数）。
+     * 当前积压条数（未确认条数，与是否物理裁剪日志无关）。
      */
     long backlog(TopicPartition tp);
+
+    /**
+     * 物理日志的起始位点（已裁剪历史之后的第一个存活位点）。
+     */
+    long baseOffset(TopicPartition tp);
 
     /**
      * 当前尚未被确认而占用容量的消息条数。
@@ -38,9 +43,10 @@ public interface MessageQueue {
     long unacked(TopicPartition tp);
 
     /**
-     * 消息被确认后释放其占用的容量。
+     * 消息被确认后释放其占用的容量，并持久化已确认位点（排他），
+     * 使重启后无需消费者接管即可复用容量。
      */
-    void releaseOne(TopicPartition tp);
+    void releaseOne(TopicPartition tp, long committedOffset);
 
     /**
      * 消费组启动/接管时，按已确认位点与物理存活区间重建未确认计数。

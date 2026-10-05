@@ -4,6 +4,8 @@ import com.github.lisama569.localmessagequeuejava.mq.exception.MessageRejectedEx
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
 import com.github.lisama569.localmessagequeuejava.mq.model.RejectReason;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
+import com.github.lisama569.localmessagequeuejava.mq.store.AckWatermarkStore;
+import com.github.lisama569.localmessagequeuejava.mq.store.FileAckWatermarkStore;
 import com.github.lisama569.localmessagequeuejava.mq.store.FileMessageLogStore;
 import com.github.lisama569.localmessagequeuejava.mq.store.MessageLogStore;
 import org.slf4j.Logger;
@@ -20,29 +22,73 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 本地消息队列实现：委派文件日志，维护关停标志与每分区容量边界。
  * 容量以“尚未被确认的消息条数”计：发送占 1，确认释放 1，确认后容量立即可复用。
+ * 已确认位点随确认路径持久化落盘，重启后无需消费者接管即可按位点重建未确认计数：
+ * 未确认条数 = 末端位点 - max(已确认位点, 物理起始位点)，与消费者是否在线、日志是否被裁剪无关。
  */
 public class LocalMessageQueue implements MessageQueue {
 
     private static final Logger log = LoggerFactory.getLogger(LocalMessageQueue.class);
 
     private final MessageLogStore logStore;
+    private final AckWatermarkStore ackStore;
     private final long perPartitionCapacity;
     private final Set<TopicPartition> knownPartitions = ConcurrentHashMap.newKeySet();
     private final Map<TopicPartition, AtomicLong> unackedCounts = new ConcurrentHashMap<>();
+    private final Map<TopicPartition, AtomicLong> ackedWatermarks = new ConcurrentHashMap<>();
     private volatile boolean shuttingDown;
 
     public LocalMessageQueue(Path dataDir, long perPartitionCapacity) {
-        this(new FileMessageLogStore(dataDir.resolve("topics")), perPartitionCapacity);
+        this(new FileMessageLogStore(dataDir.resolve("topics")),
+                new FileAckWatermarkStore(dataDir.resolve("acked")), perPartitionCapacity);
     }
 
     public LocalMessageQueue(MessageLogStore logStore, long perPartitionCapacity) {
+        this(logStore, new AckWatermarkStore() {
+            @Override
+            public long load(TopicPartition tp) {
+                return 0;
+            }
+
+            @Override
+            public void store(TopicPartition tp, long committedOffset) {
+                // 纯内存队列：不落盘
+            }
+        }, perPartitionCapacity);
+    }
+
+    public LocalMessageQueue(MessageLogStore logStore, AckWatermarkStore ackStore,
+                             long perPartitionCapacity) {
         this.logStore = logStore;
+        this.ackStore = ackStore;
         this.perPartitionCapacity = perPartitionCapacity;
     }
 
+    private long ackedWatermark(TopicPartition tp) {
+        return ackedWatermarks.computeIfAbsent(tp, k -> new AtomicLong(ackStore.load(k))).get();
+    }
+
+    private void advanceAckedWatermark(TopicPartition tp, long committedOffset) {
+        AtomicLong wm = ackedWatermarks.computeIfAbsent(tp, k -> new AtomicLong(ackStore.load(k)));
+        synchronized (wm) {
+            if (committedOffset > wm.get()) {
+                // 先落盘再推进内存值：进程中断后至多按旧水位重建，不会少算未确认
+                ackStore.store(tp, committedOffset);
+                wm.set(committedOffset);
+            }
+        }
+    }
+
     private AtomicLong counter(TopicPartition tp) {
-        // 无消费组确认信息时，物理日志条数即未确认条数（保守口径，不会超发容量）
-        return unackedCounts.computeIfAbsent(tp, k -> new AtomicLong(logStore.size(k)));
+        knownPartitions.add(tp);
+        return unackedCounts.computeIfAbsent(tp, k -> {
+            // 重启后按持久化的已确认位点与物理存活区间重建未确认计数，
+            // 不依赖消费者是否已接管，也不依赖日志是否被物理裁剪
+            long liveStart = Math.max(ackedWatermark(k), logStore.baseOffset(k));
+            long value = Math.max(0, logStore.nextOffset(k) - liveStart);
+            log.info("[容量] partition={} unacked={} committed={} base={} 判定=按持久化确认位点重建未确认计数",
+                    k.key(), value, ackedWatermark(k), logStore.baseOffset(k));
+            return new AtomicLong(value);
+        });
     }
 
     @Override
@@ -84,7 +130,13 @@ public class LocalMessageQueue implements MessageQueue {
 
     @Override
     public long backlog(TopicPartition tp) {
-        return logStore.size(tp);
+        // 积压按未确认口径：已确认消息即使物理日志尚未裁剪也不再计入
+        return unacked(tp);
+    }
+
+    @Override
+    public long baseOffset(TopicPartition tp) {
+        return logStore.baseOffset(tp);
     }
 
     @Override
@@ -93,25 +145,29 @@ public class LocalMessageQueue implements MessageQueue {
     }
 
     @Override
-    public void releaseOne(TopicPartition tp) {
+    public void releaseOne(TopicPartition tp, long committedOffset) {
         long v = counter(tp).updateAndGet(cur -> Math.max(0, cur - 1));
+        advanceAckedWatermark(tp, committedOffset);
         if (v == 0) {
-            log.info("[容量] partition={} unacked=0 判定=积压已清空，容量全部可复用", tp.key());
+            log.info("[容量] partition={} unacked=0 committed={} 判定=积压已清空，容量全部可复用",
+                    tp.key(), committedOffset);
         }
     }
 
     @Override
     public void reconcileUnacked(TopicPartition tp, long committedOffset) {
+        advanceAckedWatermark(tp, committedOffset);
         AtomicLong unacked = counter(tp);
         // 与 send 同一把锁，避免消费组启动重建计数时与并发发送互相覆盖
         synchronized (unacked) {
             // 消费组启动/接管时按已确认位点与物理存活区间重建未确认计数：
-            // 未确认条数 = 末端位点 - max(已确认位点, 物理起始位点)
-            long liveStart = Math.max(committedOffset, logStore.baseOffset(tp));
+            // 未确认条数 = 末端位点 - max(已确认位点, 持久化确认水位, 物理起始位点)
+            long liveStart = Math.max(Math.max(committedOffset, ackedWatermark(tp)),
+                    logStore.baseOffset(tp));
             long value = Math.max(0, logStore.nextOffset(tp) - liveStart);
             unacked.set(value);
             log.info("[容量] partition={} unacked={} committed={} base={} 判定=按位点重建未确认计数",
-                    tp.key(), value, committedOffset, logStore.baseOffset(tp));
+                    tp.key(), value, liveStart, logStore.baseOffset(tp));
         }
     }
 

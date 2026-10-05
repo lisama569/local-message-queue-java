@@ -10,7 +10,8 @@
 - **按分区暂停 / 恢复投递**：只停指定分区，未确认状态与顺序保留，恢复后从原位点继续（可反复调用）
 - 失败分类、指数退避重试与死信（DLQ），三类失败结果可区分
 - 重启恢复：位点、未确认队头、已确认去重集合、暂停标记、死信全部持久化，进程中断后状态一致
-- **积压与容量水位**：容量按“尚未确认的消息”实时计量，确认即释放；可按分区查询积压 / 容量 / 剩余
+- **积压与容量水位**：容量按“尚未确认的消息”实时计量，确认即释放；已确认位点随确认路径落盘，
+  重启后无需消费者接管即可复用容量；可按分区查询积压 / 容量 / 剩余
 - 积压控制与优雅关停：容量边界与关停拒绝原因明确可区分
 - 死信重放：保留原始载荷重新投递，且不绕过重复消费约束
 
@@ -125,6 +126,7 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
   ```
   <dataDir>/topics/<topic>-<partition>/data.log   # 消息日志（追加写 + fsync）
   <dataDir>/topics/<topic>-<partition>/base       # 裁剪后的起始位点
+  <dataDir>/acked/<topic>-<partition>             # 队列层已确认位点（原子写，重启后重建未确认计数）
   <dataDir>/groups/<group>/state.json             # 确认位点 + 未确认队头 + 暂停标记（原子写）
   <dataDir>/groups/<group>/processed.log          # 已确认消息 id 集合
   <dataDir>/groups/<group>/dlq.log                # 死信记录
@@ -139,8 +141,20 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
   - `backlog`：当前未确认、仍占用容量的消息条数；
   - `capacity`：该分区容量上限；
   - `remaining = capacity - backlog`：离上限还能接收多少（用于判断该扩容还是消费卡住）。
-- 消费组启动 / 热替换接管分区时，按“末端位点 − max(已确认位点, 物理起始位点)”重建未确认计数，
-  重启后水位仍准确；无消费者时未确认计数保守地等于物理存活日志条数（不会超发容量）。
+- 消费组启动 / 热替换接管分区时，按“末端位点 − max(已确认位点, 物理起始位点)”重建未确认计数。
+- **重启后的容量语义**：每条消息确认时，队列层会把该分区的已确认位点（排他）持久化到
+  `<dataDir>/acked/`（先落盘再推进内存计数）。因此用同一份数据目录重新打开后，
+  **不需要任何消费者接管**，未确认计数即按
+  “末端位点 − max(已确认位点, 物理起始位点)”重建：
+  - 已确认的消息**不再占容量**，`backlog`/`remaining` 反映真实未确认条数，新消息可立即被接收；
+  - 该行为与**消费者是否在线**、**物理日志是否被裁剪**均无关——只要消息确实确认过，
+    容量在重启后立刻可以复用，不会出现“积压已清空、队列却一直拒收”，
+    也不会出现“没接消费者时查到的数字是错的、接入之后才对”；
+  - 各分区**各自独立**计量与恢复，某个分区确认完释放的容量不影响其他分区；
+  - 从未被确认过的消息（无已确认位点记录）重启后仍按未确认计入，容量不会被错误腾空。
+
+  本地验证：`mvn test -Dtest=RestartCapacityReuseTest`
+  （覆盖“确认完 → 重启 → 暂不接入消费者”路径下的容量立即复用、按分区隔离与拒绝原因分类）。
 - 达到上限时 `send` 抛出 `MessageRejectedException(QUEUE_FULL)`；
   关停期间抛出 `MessageRejectedException(SHUTTING_DOWN)`，两种拒绝原因明确可区分（分类与旧版本一致）。
 - 容量口径与消费者组一一对应，沿用“单消费者组消费一个分区”的既有兼容范围；
@@ -162,6 +176,7 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
 | `PauseResumeTest` | 暂停期间停投但在途可完成、恢复后按序不跳消息；分区隔离；反复暂停/恢复稳定 |
 | `PauseRestartTest` | 暂停标记落盘，重启后仍暂停，恢复后从未确认位置继续 |
 | `BacklogWatermarkTest` | 确认即释放容量（不依赖裁剪）、积压清空立即复用、按分区水位、拒绝原因不回归 |
+| `RestartCapacityReuseTest` | 确认完→重启→暂不接入消费者：容量立即复用、按分区隔离、未确认积压不丢、`QUEUE_FULL`/`SHUTTING_DOWN` 分类不变 |
 
 测试日志均打印分区、位点、消息标识与判定依据
 （`[投递]/[确认]/[退避]/[死信]/[去重]/[恢复]/[暂停]/[恢复投递]/[热替换]/[容量]/[断言]`）。
@@ -171,7 +186,8 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
 - 新能力均为**增量扩展**，未改变既有发送 / 订阅 / 重试 / 死信 / 关停语义与异常分类。
 - 旧的 `state.json`（无 `paused` 字段）可被新版本直接读取，缺省按“未暂停”处理。
 - 容量计量从“物理日志条数”改为“未确认条数”：在单消费者组场景下两者结论一致，
-  且确认后无需裁剪即可复用容量；`queue.backlog()`（`GET /api/mq/backlog`）仍返回物理保留日志条数，
-  面向运维的真实未确认积压请使用 `watermark`（`GET /api/mq/watermarks`）。
+  且确认后无需裁剪即可复用容量；`queue.backlog()`（`GET /api/mq/backlog`）与
+  `watermark`（`GET /api/mq/watermarks`）的 `backlog` 均为未确认口径，
+  重启后由 `<dataDir>/acked/` 中持久化的已确认位点重建，与消费者是否在线无关。
 - 订阅者热替换与暂停/恢复均按“消费组 × 分区”生效，假设一个分区同一时间只被一个组的一个订阅者接管
   （与现有单活订阅模型一致）。

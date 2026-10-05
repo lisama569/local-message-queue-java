@@ -74,7 +74,7 @@ public class MessageConsumer implements AutoCloseable {
             for (TopicPartition tp : subscriptions) {
                 PartitionState st = states.get(tp);
                 if (st == null) {
-                    st = PartitionState.init(queue.nextOffset(tp) - queue.backlog(tp));
+                    st = PartitionState.init(queue.baseOffset(tp));
                     states.put(tp, st);
                 }
                 if (st.hasHead() && st.head().stage() == Stage.IN_FLIGHT) {
@@ -129,7 +129,7 @@ public class MessageConsumer implements AutoCloseable {
                 return;
             }
             if (!st.hasHead()) {
-                long fetchOffset = Math.max(st.committedOffset(), queue.nextOffset(tp) - queue.backlog(tp));
+                long fetchOffset = Math.max(st.committedOffset(), queue.baseOffset(tp));
                 Message msg = queue.fetch(tp, fetchOffset);
                 if (msg == null) {
                     return;
@@ -302,7 +302,7 @@ public class MessageConsumer implements AutoCloseable {
      * 必须在持有 stateLock 时调用。
      */
     private void afterCommit(TopicPartition tp, long committedOffset) {
-        queue.releaseOne(tp);
+        queue.releaseOne(tp, committedOffset);
         if (options.isTruncateCommittedLog()) {
             queue.truncateBefore(tp, committedOffset);
         }
