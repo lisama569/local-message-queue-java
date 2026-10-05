@@ -4,6 +4,7 @@ import com.github.lisama569.localmessagequeuejava.mq.exception.MessageRejectedEx
 import com.github.lisama569.localmessagequeuejava.mq.model.Message;
 import com.github.lisama569.localmessagequeuejava.mq.model.RejectReason;
 import com.github.lisama569.localmessagequeuejava.mq.model.TopicPartition;
+import com.github.lisama569.localmessagequeuejava.mq.store.CommittedOffsetStore;
 import com.github.lisama569.localmessagequeuejava.mq.store.FileMessageLogStore;
 import com.github.lisama569.localmessagequeuejava.mq.store.MessageLogStore;
 import org.slf4j.Logger;
@@ -20,29 +21,53 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * 本地消息队列实现：委派文件日志，维护关停标志与每分区容量边界。
  * 容量以“尚未被确认的消息条数”计：发送占 1，确认释放 1，确认后容量立即可复用。
+ * 确认水位（每分区已确认到的位点）持久化到数据目录，重启后无需消费者接管，
+ * 即可按 未确认 = nextOffset - max(确认水位, 物理起始位点) 恢复积压与剩余容量，
+ * 与物理日志是否裁剪无关。
  */
 public class LocalMessageQueue implements MessageQueue {
 
     private static final Logger log = LoggerFactory.getLogger(LocalMessageQueue.class);
 
     private final MessageLogStore logStore;
+    private final CommittedOffsetStore committedOffsetStore;
     private final long perPartitionCapacity;
     private final Set<TopicPartition> knownPartitions = ConcurrentHashMap.newKeySet();
     private final Map<TopicPartition, AtomicLong> unackedCounts = new ConcurrentHashMap<>();
     private volatile boolean shuttingDown;
 
     public LocalMessageQueue(Path dataDir, long perPartitionCapacity) {
-        this(new FileMessageLogStore(dataDir.resolve("topics")), perPartitionCapacity);
+        this(new FileMessageLogStore(dataDir.resolve("topics")),
+                new CommittedOffsetStore(dataDir.resolve("committed-offsets.json")), perPartitionCapacity);
     }
 
     public LocalMessageQueue(MessageLogStore logStore, long perPartitionCapacity) {
+        this(logStore, null, perPartitionCapacity);
+    }
+
+    public LocalMessageQueue(MessageLogStore logStore, CommittedOffsetStore committedOffsetStore,
+                             long perPartitionCapacity) {
         this.logStore = logStore;
+        this.committedOffsetStore = committedOffsetStore;
         this.perPartitionCapacity = perPartitionCapacity;
     }
 
+    /** 已确认到的位点：无持久化记录时退回物理起始位点（保守口径，不会超发容量）。 */
+    private long committedWatermark(TopicPartition tp) {
+        Long persisted = committedOffsetStore == null ? null : committedOffsetStore.load(tp);
+        return persisted == null ? logStore.baseOffset(tp) : Math.max(persisted, logStore.baseOffset(tp));
+    }
+
     private AtomicLong counter(TopicPartition tp) {
-        // 无消费组确认信息时，物理日志条数即未确认条数（保守口径，不会超发容量）
-        return unackedCounts.computeIfAbsent(tp, k -> new AtomicLong(logStore.size(k)));
+        // 重启/首次触及时按持久化确认水位重建未确认计数：
+        // 未确认条数 = 末端位点 - max(确认水位, 物理起始位点)；无水位记录时即物理存活条数（保守）
+        return unackedCounts.computeIfAbsent(tp, k -> {
+            long value = Math.max(0, logStore.nextOffset(k) - committedWatermark(k));
+            knownPartitions.add(k);
+            log.info("[容量] partition={} unacked={} committed={} base={} 判定=按持久化确认水位重建未确认计数",
+                    k.key(), value, committedWatermark(k), logStore.baseOffset(k));
+            return new AtomicLong(value);
+        });
     }
 
     @Override
@@ -83,8 +108,13 @@ public class LocalMessageQueue implements MessageQueue {
     }
 
     @Override
+    public long baseOffset(TopicPartition tp) {
+        return logStore.baseOffset(tp);
+    }
+
+    @Override
     public long backlog(TopicPartition tp) {
-        return logStore.size(tp);
+        return counter(tp).get();
     }
 
     @Override
@@ -93,25 +123,19 @@ public class LocalMessageQueue implements MessageQueue {
     }
 
     @Override
-    public void releaseOne(TopicPartition tp) {
-        long v = counter(tp).updateAndGet(cur -> Math.max(0, cur - 1));
-        if (v == 0) {
-            log.info("[容量] partition={} unacked=0 判定=积压已清空，容量全部可复用", tp.key());
-        }
-    }
-
-    @Override
-    public void reconcileUnacked(TopicPartition tp, long committedOffset) {
+    public void commit(TopicPartition tp, long committedOffset) {
         AtomicLong unacked = counter(tp);
-        // 与 send 同一把锁，避免消费组启动重建计数时与并发发送互相覆盖
+        // 与 send 同一把锁，避免确认推进与并发发送互相覆盖
         synchronized (unacked) {
-            // 消费组启动/接管时按已确认位点与物理存活区间重建未确认计数：
-            // 未确认条数 = 末端位点 - max(已确认位点, 物理起始位点)
-            long liveStart = Math.max(committedOffset, logStore.baseOffset(tp));
+            // 确认水位单调不减并持久化：重启后无需消费者即可按位点恢复容量口径
+            long watermark = committedOffsetStore == null
+                    ? Math.max(committedWatermark(tp), committedOffset)
+                    : committedOffsetStore.advance(tp, committedOffset);
+            long liveStart = Math.max(watermark, logStore.baseOffset(tp));
             long value = Math.max(0, logStore.nextOffset(tp) - liveStart);
             unacked.set(value);
-            log.info("[容量] partition={} unacked={} committed={} base={} 判定=按位点重建未确认计数",
-                    tp.key(), value, committedOffset, logStore.baseOffset(tp));
+            log.info("[容量] partition={} unacked={} committed={} base={} 判定=确认水位推进并落盘，容量按未确认条数重建",
+                    tp.key(), value, watermark, logStore.baseOffset(tp));
         }
     }
 
@@ -134,7 +158,7 @@ public class LocalMessageQueue implements MessageQueue {
     }
 
     /**
-     * 物理丢弃已确认的历史日志（释放容量）。
+     * 物理丢弃已确认的历史日志（释放磁盘；容量口径不依赖裁剪）。
      */
     public void truncateBefore(TopicPartition tp, long truncateBefore) {
         logStore.truncateBefore(tp, truncateBefore);

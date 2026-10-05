@@ -9,6 +9,7 @@ import java.util.List;
 
 /**
  * 本地消息队列：主题/分区语义、容量控制与位点读取。
+ * 容量与积压均以“尚未被确认的消息条数”计，确认位点持久化，重启后不依赖消费者即可恢复。
  */
 public interface MessageQueue {
 
@@ -28,24 +29,26 @@ public interface MessageQueue {
     long nextOffset(TopicPartition tp);
 
     /**
-     * 当前积压条数（物理日志条数）。
+     * 物理日志的起始位点（被裁剪后大于 0）。
+     */
+    long baseOffset(TopicPartition tp);
+
+    /**
+     * 当前积压条数：尚未被确认、仍占用容量的消息条数（与是否裁剪物理日志无关）。
      */
     long backlog(TopicPartition tp);
 
     /**
-     * 当前尚未被确认而占用容量的消息条数。
+     * 当前尚未被确认而占用容量的消息条数（与 {@link #backlog(TopicPartition)} 同口径）。
      */
     long unacked(TopicPartition tp);
 
     /**
-     * 消息被确认后释放其占用的容量。
+     * 将分区的确认位点推进到 committedOffset（单调不减）：
+     * 重建未确认计数、释放已确认消息占用的容量，并把确认水位持久化；
+     * 消费组启动/接管时与每条消息确认时都调用，重启后无需消费者即可恢复容量口径。
      */
-    void releaseOne(TopicPartition tp);
-
-    /**
-     * 消费组启动/接管时，按已确认位点与物理存活区间重建未确认计数。
-     */
-    void reconcileUnacked(TopicPartition tp, long committedOffset);
+    void commit(TopicPartition tp, long committedOffset);
 
     /**
      * 分区容量上限。
@@ -57,7 +60,8 @@ public interface MessageQueue {
     List<Message> drainRange(TopicPartition tp, long fromOffset, long toOffset);
 
     /**
-     * 物理丢弃 offset &lt; truncateBefore 的已确认历史日志以释放容量（仅允许用于已确认数据）。
+     * 物理丢弃 offset &lt; truncateBefore 的已确认历史日志以释放磁盘（仅允许用于已确认数据；
+     * 容量不依赖裁剪，裁剪与否不影响积压与剩余容量口径）。
      */
     void truncateBefore(TopicPartition tp, long truncateBefore);
 

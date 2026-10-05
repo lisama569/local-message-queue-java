@@ -10,7 +10,8 @@
 - **按分区暂停 / 恢复投递**：只停指定分区，未确认状态与顺序保留，恢复后从原位点继续（可反复调用）
 - 失败分类、指数退避重试与死信（DLQ），三类失败结果可区分
 - 重启恢复：位点、未确认队头、已确认去重集合、暂停标记、死信全部持久化，进程中断后状态一致
-- **积压与容量水位**：容量按“尚未确认的消息”实时计量，确认即释放；可按分区查询积压 / 容量 / 剩余
+- **积压与容量水位**：容量按“尚未确认的消息”实时计量，确认即释放；确认水位持久化，
+  重启后消费者尚未接管时积压与剩余容量即已准确；可按分区查询积压 / 容量 / 剩余
 - 积压控制与优雅关停：容量边界与关停拒绝原因明确可区分
 - 死信重放：保留原始载荷重新投递，且不绕过重复消费约束
 
@@ -34,6 +35,8 @@ curl -X POST localhost:8080/api/mq/send -H 'Content-Type: application/json' \
 curl 'localhost:8080/api/mq/offsets?group=g1'
 # 查询所有分区的积压/容量水位（backlog=未确认条数，remaining=离上限还可接收多少）
 curl 'localhost:8080/api/mq/watermarks'
+# 按分区查询积压（与水位同口径：未确认条数，重启后消费者未接管时也准确）
+curl 'localhost:8080/api/mq/backlog?topic=orders&partitions=2'
 # 暂停 / 恢复某消费组在指定分区上的投递（changed 表示状态是否发生变化，重复调用为 false）
 curl -X POST 'localhost:8080/api/mq/pause?group=g1&topic=orders&partition=0'
 curl -X POST 'localhost:8080/api/mq/resume?group=g1&topic=orders&partition=0'
@@ -125,6 +128,7 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
   ```
   <dataDir>/topics/<topic>-<partition>/data.log   # 消息日志（追加写 + fsync）
   <dataDir>/topics/<topic>-<partition>/base       # 裁剪后的起始位点
+  <dataDir>/committed-offsets.json                # 每分区确认水位（单调不减，原子写）
   <dataDir>/groups/<group>/state.json             # 确认位点 + 未确认队头 + 暂停标记（原子写）
   <dataDir>/groups/<group>/processed.log          # 已确认消息 id 集合
   <dataDir>/groups/<group>/dlq.log                # 死信记录
@@ -135,16 +139,24 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
 - 每分区容量上限（`perPartitionCapacity`）以**尚未被确认的消息条数**计量：
   每发送一条占 1 个名额，消息一旦被确认（处理成功 / 去重跳过 / 进入死信）其名额**立即释放**，
   随后即可接收新消息——**不依赖**日志裁剪，不会出现“积压已清空却仍一直拒收”。
+- **确认后容量释放与重启恢复**：每条消息确认时，队列把该分区的确认水位
+  （已确认到的位点，单调不减）持久化到 `<dataDir>/committed-offsets.json`（原子写 + fsync）。
+  重启后无论消费者是否已接管、物理日志是否被裁剪，分区未确认条数都按
+  `末端位点 − max(确认水位, 物理起始位点)` 立即恢复：**已确认的消息不再占容量**，
+  积压与剩余容量反映真实未确认条数，新发送可正常被接收；各分区水位各自独立、互不影响。
+  从未有过确认记录的分区按物理存活条数保守计量（不会超发容量）。
 - 水位查询（`MqService.watermark(tp)` / `watermarks()`，HTTP：`GET /api/mq/watermarks`）按分区返回：
-  - `backlog`：当前未确认、仍占用容量的消息条数；
+  - `backlog`：当前未确认、仍占用容量的消息条数（消费者未接管时同口径）；
   - `capacity`：该分区容量上限；
   - `remaining = capacity - backlog`：离上限还能接收多少（用于判断该扩容还是消费卡住）。
-- 消费组启动 / 热替换接管分区时，按“末端位点 − max(已确认位点, 物理起始位点)”重建未确认计数，
-  重启后水位仍准确；无消费者时未确认计数保守地等于物理存活日志条数（不会超发容量）。
+  `queue.backlog(tp)`（HTTP：`GET /api/mq/backlog`）与水位同为未确认口径；
+  物理保留情况可另看 `baseOffset` / `nextOffset`。
+- 消费组启动 / 热替换接管分区时，同样按确认水位推进未确认计数，与每条确认走同一口径。
 - 达到上限时 `send` 抛出 `MessageRejectedException(QUEUE_FULL)`；
   关停期间抛出 `MessageRejectedException(SHUTTING_DOWN)`，两种拒绝原因明确可区分（分类与旧版本一致）。
 - 容量口径与消费者组一一对应，沿用“单消费者组消费一个分区”的既有兼容范围；
-  `truncateCommittedLog(true)` 仍可选开启，用于物理裁剪已确认历史日志、控制磁盘占用（位点单调不复用）。
+  `truncateCommittedLog(true)` 仍可选开启，用于物理裁剪已确认历史日志、控制磁盘占用（位点单调不复用），
+  裁剪与否不影响积压与剩余容量口径。
 - 优雅关停（`MqService.close()`）：先拒收新消息，再停止拉取新任务，
   等待在途处理完成（宽限期 = `max(5s, processingTimeout + 2s)`），超时强制中断；
   所有已开始处理的确认/重试/死信状态均已落盘，下次启动可恢复。
@@ -162,16 +174,32 @@ Map<TopicPartition, PartitionWatermark> all = service.watermarks();
 | `PauseResumeTest` | 暂停期间停投但在途可完成、恢复后按序不跳消息；分区隔离；反复暂停/恢复稳定 |
 | `PauseRestartTest` | 暂停标记落盘，重启后仍暂停，恢复后从未确认位置继续 |
 | `BacklogWatermarkTest` | 确认即释放容量（不依赖裁剪）、积压清空立即复用、按分区水位、拒绝原因不回归 |
+| `RestartCapacityReuseTest` | 确认完→重启→消费者未接管：容量立即复用、按分区隔离、裁剪与否口径一致、拒绝原因分类不回归 |
 
 测试日志均打印分区、位点、消息标识与判定依据
 （`[投递]/[确认]/[退避]/[死信]/[去重]/[恢复]/[暂停]/[恢复投递]/[热替换]/[容量]/[断言]`）。
+
+本地手动验证“确认完 → 重启 → 消费者未接管”路径：
+
+```bash
+# 1. 启动服务（容量默认见 mq.per-partition-capacity），发送若干消息并等消费组确认
+curl -X POST localhost:8080/api/mq/send -H 'Content-Type: application/json' \
+  -d '{"topic":"orders","partition":0,"messageId":"m1","payload":"hello"}'
+curl 'localhost:8080/api/mq/watermarks'   # backlog 归 0 即确认完
+# 2. 停掉进程，用同一 --mq.data-dir 重新启动（先不注册/等待消费者）
+# 3. 消费者尚未接管时直接查水位：已确认消息不再计入积压，remaining 已恢复
+curl 'localhost:8080/api/mq/watermarks'
+curl 'localhost:8080/api/mq/backlog?topic=orders&partitions=1'
+# 4. 继续发送新消息，可正常被接收（不再被误拒 QUEUE_FULL）
+```
 
 ## 兼容范围
 
 - 新能力均为**增量扩展**，未改变既有发送 / 订阅 / 重试 / 死信 / 关停语义与异常分类。
 - 旧的 `state.json`（无 `paused` 字段）可被新版本直接读取，缺省按“未暂停”处理。
 - 容量计量从“物理日志条数”改为“未确认条数”：在单消费者组场景下两者结论一致，
-  且确认后无需裁剪即可复用容量；`queue.backlog()`（`GET /api/mq/backlog`）仍返回物理保留日志条数，
-  面向运维的真实未确认积压请使用 `watermark`（`GET /api/mq/watermarks`）。
+  且确认后无需裁剪即可复用容量；确认水位持久化在 `committed-offsets.json`，
+  重启后消费者尚未接管时 `backlog` / `watermark` 即按真实未确认条数返回，
+  不再把已确认消息计入积压或容量占用。
 - 订阅者热替换与暂停/恢复均按“消费组 × 分区”生效，假设一个分区同一时间只被一个组的一个订阅者接管
   （与现有单活订阅模型一致）。

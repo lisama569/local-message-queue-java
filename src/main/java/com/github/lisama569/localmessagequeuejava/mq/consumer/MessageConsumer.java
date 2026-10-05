@@ -74,7 +74,7 @@ public class MessageConsumer implements AutoCloseable {
             for (TopicPartition tp : subscriptions) {
                 PartitionState st = states.get(tp);
                 if (st == null) {
-                    st = PartitionState.init(queue.nextOffset(tp) - queue.backlog(tp));
+                    st = PartitionState.init(queue.baseOffset(tp));
                     states.put(tp, st);
                 }
                 if (st.hasHead() && st.head().stage() == Stage.IN_FLIGHT) {
@@ -87,7 +87,7 @@ public class MessageConsumer implements AutoCloseable {
                             group, tp.key(), h.offset(), h.messageId(), recovered.attempts());
                 }
                 // 接管分区时按已确认位点重建未确认计数，使容量水位与消费进度一致
-                queue.reconcileUnacked(tp, states.get(tp).committedOffset());
+                queue.commit(tp, states.get(tp).committedOffset());
             }
             persist();
         }
@@ -129,7 +129,7 @@ public class MessageConsumer implements AutoCloseable {
                 return;
             }
             if (!st.hasHead()) {
-                long fetchOffset = Math.max(st.committedOffset(), queue.nextOffset(tp) - queue.backlog(tp));
+                long fetchOffset = Math.max(st.committedOffset(), queue.baseOffset(tp));
                 Message msg = queue.fetch(tp, fetchOffset);
                 if (msg == null) {
                     return;
@@ -298,11 +298,11 @@ public class MessageConsumer implements AutoCloseable {
 
     /**
      * 一条消息被确认（成功/去重/死信）后的容量处理：
-     * 立即释放 1 个未确认占额；开启裁剪时再物理丢弃已提交历史日志。
+     * 推进确认水位并落盘，立即释放其占用的容量；开启裁剪时再物理丢弃已提交历史日志。
      * 必须在持有 stateLock 时调用。
      */
     private void afterCommit(TopicPartition tp, long committedOffset) {
-        queue.releaseOne(tp);
+        queue.commit(tp, committedOffset);
         if (options.isTruncateCommittedLog()) {
             queue.truncateBefore(tp, committedOffset);
         }
